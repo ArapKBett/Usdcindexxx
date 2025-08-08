@@ -6,13 +6,14 @@ use solana_client::{
 };
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::{UiInstruction, UiParsedInstruction, UiTransactionEncoding};
+use std::convert::Infallible;
 use std::str::FromStr;
+use warp::Filter;
 
 const USDC_MINT_ADDRESS: &str = "Es9vMFrzaCERH16Cdv83hA5KaM6rDx8JEX5Rk3z3aZ9o";
 const WALLET_ADDRESS: &str = "7cMEhpt9y3inBNVv8fNnuaEbx7hKHZnLvR1KWKKxuDDU";
 
-#[tokio::main]
-async fn main() -> Result<()> {
+async fn backfill_usdc_transfers() -> Result<String> {
     let rpc_url = "https://api.mainnet-beta.solana.com";
     let client = RpcClient::new(rpc_url.to_string());
 
@@ -22,7 +23,6 @@ async fn main() -> Result<()> {
     let cutoff_ts = (now.timestamp() - 24 * 3600) as u64;
 
     let mut before_signature: Option<String> = None;
-
     let mut transfers = Vec::new();
 
     'outer: loop {
@@ -57,7 +57,6 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
-                        // parsed is a serde_json::Value, parse it
                         if let Some(instruction_type) = parsed.get("type").and_then(|v| v.as_str()) {
                             if instruction_type != "transfer" && instruction_type != "transferChecked" {
                                 continue;
@@ -69,7 +68,6 @@ async fn main() -> Result<()> {
                             }
                             let info = info.unwrap();
 
-                            // Check mint address
                             if let Some(mint) = info.get("mint").and_then(|v| v.as_str()) {
                                 if mint != USDC_MINT_ADDRESS {
                                     continue;
@@ -91,10 +89,8 @@ async fn main() -> Result<()> {
                                 continue;
                             }
 
-                            // USDC decimals = 6, convert to float
                             let amount = amount_u64 as f64 / 1_000_000f64;
 
-                            // Determine direction
                             let direction = if let Some(src) = source {
                                 if src == WALLET_ADDRESS {
                                     "sent"
@@ -111,13 +107,12 @@ async fn main() -> Result<()> {
                                 continue;
                             };
 
-                            // Convert block_time to DateTime<Utc>
                             let date = DateTime::<Utc>::from_utc(
                                 NaiveDateTime::from_timestamp(block_time as i64, 0),
                                 Utc,
                             );
 
-                            transfers.push((date, amount, direction.to_string(), sig_info.signature.clone()));
+                            transfers.push(format!("{} | {}{:.6} USDC | {}", date.to_rfc3339(), if direction == "sent" { "-" } else { "+" }, amount, direction));
                         }
                     }
                 }
@@ -127,15 +122,31 @@ async fn main() -> Result<()> {
         before_signature = sigs.last().map(|s| s.signature.clone());
     }
 
-    // Sort by date ascending
-    transfers.sort_by_key(|t| t.0);
+    transfers.sort();
 
-    println!("USDC transfers for wallet: {} (last 24h)", WALLET_ADDRESS);
-    for (date, amount, direction, _signature) in transfers {
-        let sign = if direction == "sent" { "-" } else { "+" };
-        println!("{} | {}{:.6} USDC | {}", date.to_rfc3339(), sign, amount, direction);
+    let result = transfers.join("\n");
+    Ok(result)
+}
+
+// Warp HTTP handler returning the indexer output or error
+async fn handle_backfill() -> Result<impl warp::Reply, Infallible> {
+    match backfill_usdc_transfers().await {
+        Ok(data) => Ok(warp::reply::with_status(data, warp::http::StatusCode::OK)),
+        Err(e) => Ok(warp::reply::with_status(
+            format!("Error: {}", e),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )),
     }
+}
 
-    Ok(())
-  }
-                      
+#[tokio::main]
+async fn main() {
+    // Warp filter for the /backfill route
+    let backfill_route = warp::path("backfill")
+        .and(warp::get())
+        .and_then(handle_backfill);
+
+    // Bind to 0.0.0.0:10000 for Render web service
+    warp::serve(backfill_route).run(([0, 0, 0, 0], 10000)).await;
+                            }
+                                
