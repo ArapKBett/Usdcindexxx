@@ -12,6 +12,3 @@ chrono = "0.4"
 anyhow = "1.0"
 serde_json = "1.0"
 warp = "0.3"
-
-[patch.crates-io]
-digest = "=0.10.7"
