@@ -1,12 +1,13 @@
 use anyhow::Result;
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use solana_client::{
     rpc_client::RpcClient,
-    rpc_config::RpcSignaturesForAddressConfig,
+    rpc_config::{GetConfirmedSignaturesForAddress2Config, RpcTransactionConfig},
 };
 use solana_sdk::pubkey::Pubkey;
-use solana_transaction_status::{UiInstruction, UiParsedInstruction, UiTransactionEncoding};
-use std::convert::Infallible;
+use solana_transaction_status::{
+    EncodedTransaction, UiInstruction, UiParsedInstruction, UiTransactionEncoding,
+};
 use std::str::FromStr;
 use warp::Filter;
 
@@ -20,7 +21,7 @@ async fn backfill_usdc_transfers() -> Result<String> {
     let wallet = Pubkey::from_str(WALLET_ADDRESS)?;
 
     let now = chrono::Utc::now();
-    let cutoff_ts = (now.timestamp() - 24 * 3600) as u64;
+    let cutoff_ts = now.timestamp() - 24 * 3600;
 
     let mut before_signature: Option<String> = None;
     let mut transfers = Vec::new();
@@ -28,7 +29,7 @@ async fn backfill_usdc_transfers() -> Result<String> {
     'outer: loop {
         let sigs = client.get_signatures_for_address_with_config(
             &wallet,
-            RpcSignaturesForAddressConfig {
+            GetConfirmedSignaturesForAddress2Config {
                 before: before_signature.clone(),
                 limit: Some(1000),
                 ..Default::default()
@@ -40,34 +41,55 @@ async fn backfill_usdc_transfers() -> Result<String> {
         }
 
         for sig_info in &sigs {
-            let block_time = sig_info.block_time.unwrap_or(0) as u64;
+            let block_time = sig_info.block_time.unwrap_or(0);
             if block_time < cutoff_ts {
                 break 'outer;
             }
 
-            let tx = client.get_transaction(
+            // Fetch transaction with parsed info enabled
+            let tx = client.get_transaction_with_config(
                 &sig_info.signature.parse()?,
-                UiTransactionEncoding::JsonParsed,
+                RpcTransactionConfig {
+                    encoding: Some(UiTransactionEncoding::JsonParsed),
+                    commitment: None,
+                    max_supported_transaction_version: None,
+                },
             )?;
 
-            if let Some(message) = &tx.transaction.transaction.message {
-                for ix in &message.instructions {
-                    if let UiInstruction::Parsed(UiParsedInstruction { program, parsed, .. }) = ix {
-                        if program != "spl-token" {
-                            continue;
-                        }
+            let enc_tx = &tx.transaction.transaction;
 
-                        if let Some(instruction_type) = parsed.get("type").and_then(|v| v.as_str()) {
+            // Decode or parse the transaction message to access instructions
+            let instructions = match enc_tx {
+                EncodedTransaction::Json(parsed_tx) => &parsed_tx.message.instructions,
+                _ => {
+                    // If not JsonParsed, skip since we rely on parsed instructions
+                    continue;
+                }
+            };
+
+            for ix in instructions {
+                if let UiInstruction::Parsed(ui_parsed) = ix {
+                    // UiParsedInstruction is an enum - match to access inner ParsedInstruction
+                    match ui_parsed {
+                        UiParsedInstruction::Parsed(parsed) => {
+                            if parsed.program != "spl-token" {
+                                continue;
+                            }
+                            let instruction_type = parsed
+                                .parsed
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
                             if instruction_type != "transfer" && instruction_type != "transferChecked" {
                                 continue;
                             }
-
-                            let info = parsed.get("info");
+                            let info = parsed.parsed.get("info");
                             if info.is_none() {
                                 continue;
                             }
                             let info = info.unwrap();
 
+                            // Check mint
                             if let Some(mint) = info.get("mint").and_then(|v| v.as_str()) {
                                 if mint != USDC_MINT_ADDRESS {
                                     continue;
@@ -76,13 +98,14 @@ async fn backfill_usdc_transfers() -> Result<String> {
 
                             let source = info.get("source").and_then(|v| v.as_str());
                             let destination = info.get("destination").and_then(|v| v.as_str());
-                            let amount_str = if let Some(a) = info.get("amount").and_then(|v| v.as_str()) {
-                                a.to_string()
-                            } else if let Some(token_amount) = info.get("tokenAmount") {
-                                token_amount.get("amount").and_then(|v| v.as_str()).unwrap_or("0").to_string()
-                            } else {
-                                "0".to_string()
-                            };
+                            let amount_str = info
+                                .get("amount")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| {
+                                    info.get("tokenAmount")
+                                        .and_then(|token_amount| token_amount.get("amount").and_then(|v| v.as_str()))
+                                })
+                                .unwrap_or("0");
 
                             let amount_u64 = amount_str.parse::<u64>().unwrap_or(0);
                             if amount_u64 == 0 {
@@ -107,13 +130,17 @@ async fn backfill_usdc_transfers() -> Result<String> {
                                 continue;
                             };
 
-                            let date = DateTime::<Utc>::from_utc(
-                                NaiveDateTime::from_timestamp(block_time as i64, 0),
-                                Utc,
-                            );
+                            let date = DateTime::<Utc>::from_timestamp(block_time, 0);
 
-                            transfers.push(format!("{} | {}{:.6} USDC | {}", date.to_rfc3339(), if direction == "sent" { "-" } else { "+" }, amount, direction));
+                            transfers.push(format!(
+                                "{} | {}{:.6} USDC | {}",
+                                date.to_rfc3339(),
+                                if direction == "sent" { "-" } else { "+" },
+                                amount,
+                                direction,
+                            ));
                         }
+                        _ => continue,
                     }
                 }
             }
@@ -123,13 +150,10 @@ async fn backfill_usdc_transfers() -> Result<String> {
     }
 
     transfers.sort();
-
-    let result = transfers.join("\n");
-    Ok(result)
+    Ok(transfers.join("\n"))
 }
 
-// Warp HTTP handler returning the indexer output or error
-async fn handle_backfill() -> Result<impl warp::Reply, Infallible> {
+async fn handle_backfill() -> Result<impl warp::Reply, warp::Rejection> {
     match backfill_usdc_transfers().await {
         Ok(data) => Ok(warp::reply::with_status(data, warp::http::StatusCode::OK)),
         Err(e) => Ok(warp::reply::with_status(
@@ -141,12 +165,10 @@ async fn handle_backfill() -> Result<impl warp::Reply, Infallible> {
 
 #[tokio::main]
 async fn main() {
-    // Warp filter for the /backfill route
-    let backfill_route = warp::path("backfill")
-        .and(warp::get())
-        .and_then(handle_backfill);
+    // Warp filter for /backfill route
+    let route = warp::path("backfill").and(warp::get()).and_then(handle_backfill);
 
-    // Bind to 0.0.0.0:10000 for Render web service
-    warp::serve(backfill_route).run(([0, 0, 0, 0], 10000)).await;
-                            }
-                                
+    // Listen on 0.0.0.0:10000 for Render
+    warp::serve(route).run(([0, 0, 0, 0], 10000)).await;
+                }
+        
