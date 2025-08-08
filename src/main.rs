@@ -1,9 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use solana_client::{
-    rpc_client::RpcClient,
-    rpc_config::{GetConfirmedSignaturesForAddress2Config, RpcTransactionConfig},
-};
+use solana_client::rpc_client::{RpcClient, GetSignaturesForAddressConfig};
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::{
     EncodedTransaction, UiInstruction, UiParsedInstruction, UiTransactionEncoding,
@@ -29,7 +26,7 @@ async fn backfill_usdc_transfers() -> Result<String> {
     'outer: loop {
         let sigs = client.get_signatures_for_address_with_config(
             &wallet,
-            GetConfirmedSignaturesForAddress2Config {
+            GetSignaturesForAddressConfig {
                 before: before_signature.clone(),
                 limit: Some(1000),
                 ..Default::default()
@@ -41,15 +38,21 @@ async fn backfill_usdc_transfers() -> Result<String> {
         }
 
         for sig_info in &sigs {
-            let block_time = sig_info.block_time.unwrap_or(0);
+            let block_time_opt = sig_info.block_time;
+            if block_time_opt.is_none() {
+                // Skip if no block time
+                continue;
+            }
+            let block_time = block_time_opt.unwrap();
+
             if block_time < cutoff_ts {
                 break 'outer;
             }
 
-            // Fetch transaction with parsed info enabled
+            // Fetch transaction with parsed JSON encoding
             let tx = client.get_transaction_with_config(
                 &sig_info.signature.parse()?,
-                RpcTransactionConfig {
+                solana_client::rpc_config::RpcTransactionConfig {
                     encoding: Some(UiTransactionEncoding::JsonParsed),
                     commitment: None,
                     max_supported_transaction_version: None,
@@ -58,23 +61,21 @@ async fn backfill_usdc_transfers() -> Result<String> {
 
             let enc_tx = &tx.transaction.transaction;
 
-            // Decode or parse the transaction message to access instructions
+            // Only handle JsonParsed transactions
             let instructions = match enc_tx {
                 EncodedTransaction::Json(parsed_tx) => &parsed_tx.message.instructions,
-                _ => {
-                    // If not JsonParsed, skip since we rely on parsed instructions
-                    continue;
-                }
+                _ => continue,
             };
 
             for ix in instructions {
                 if let UiInstruction::Parsed(ui_parsed) = ix {
-                    // UiParsedInstruction is an enum - match to access inner ParsedInstruction
+                    // UiParsedInstruction is an enum, handle variants
                     match ui_parsed {
                         UiParsedInstruction::Parsed(parsed) => {
                             if parsed.program != "spl-token" {
                                 continue;
                             }
+
                             let instruction_type = parsed
                                 .parsed
                                 .get("type")
@@ -83,13 +84,13 @@ async fn backfill_usdc_transfers() -> Result<String> {
                             if instruction_type != "transfer" && instruction_type != "transferChecked" {
                                 continue;
                             }
-                            let info = parsed.parsed.get("info");
-                            if info.is_none() {
-                                continue;
-                            }
-                            let info = info.unwrap();
 
-                            // Check mint
+                            let info = match parsed.parsed.get("info") {
+                                Some(i) => i,
+                                None => continue,
+                            };
+
+                            // Check mint address
                             if let Some(mint) = info.get("mint").and_then(|v| v.as_str()) {
                                 if mint != USDC_MINT_ADDRESS {
                                     continue;
@@ -98,6 +99,7 @@ async fn backfill_usdc_transfers() -> Result<String> {
 
                             let source = info.get("source").and_then(|v| v.as_str());
                             let destination = info.get("destination").and_then(|v| v.as_str());
+
                             let amount_str = info
                                 .get("amount")
                                 .and_then(|v| v.as_str())
@@ -112,7 +114,7 @@ async fn backfill_usdc_transfers() -> Result<String> {
                                 continue;
                             }
 
-                            let amount = amount_u64 as f64 / 1_000_000f64;
+                            let amount = amount_u64 as f64 / 1_000_000f64; // USDC has 6 decimals
 
                             let direction = if let Some(src) = source {
                                 if src == WALLET_ADDRESS {
@@ -130,7 +132,10 @@ async fn backfill_usdc_transfers() -> Result<String> {
                                 continue;
                             };
 
-                            let date = DateTime::<Utc>::from_timestamp(block_time, 0);
+                            let date = DateTime::<Utc>::from_utc(
+                                chrono::NaiveDateTime::from_timestamp(block_time, 0),
+                                Utc,
+                            );
 
                             transfers.push(format!(
                                 "{} | {}{:.6} USDC | {}",
@@ -165,10 +170,9 @@ async fn handle_backfill() -> Result<impl warp::Reply, warp::Rejection> {
 
 #[tokio::main]
 async fn main() {
-    // Warp filter for /backfill route
     let route = warp::path("backfill").and(warp::get()).and_then(handle_backfill);
 
-    // Listen on 0.0.0.0:10000 for Render
+    // Listen on 0.0.0.0:10000 (Render default)
     warp::serve(route).run(([0, 0, 0, 0], 10000)).await;
-                }
-        
+                            }
+                                         
