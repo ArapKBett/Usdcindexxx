@@ -1,0 +1,13 @@
+[package]
+name = "solana_usdc_indexer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+solana-client = "2.0.0"
+solana-sdk = "1.14.17"
+solana-transaction-status = "1.14.17"
+tokio = { version = "1", features = ["full"] }
+chrono = "0.4"
+anyhow = "1.0"
+serde_json = "1.0"
