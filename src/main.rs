@@ -2,7 +2,11 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use solana_client::rpc_client::{RpcClient, GetConfirmedSignaturesForAddress2Config};
 use solana_client::rpc_config::RpcTransactionConfig;
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{
+    pubkey::Pubkey,
+    signature::Signature,
+    commitment_config::CommitmentConfig,
+};
 use solana_transaction_status::{
     EncodedTransaction, UiInstruction, UiParsedInstruction, UiTransactionEncoding,
 };
@@ -14,24 +18,24 @@ const WALLET_ADDRESS: &str = "7cMEhpt9y3inBNVv8fNnuaEbx7hKHZnLvR1KWKKxuDDU";
 
 async fn backfill_usdc_transfers() -> Result<String> {
     let rpc_url = "https://api.mainnet-beta.solana.com";
-    let client = RpcClient::new(rpc_url.to_string());
+    let client = RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::confirmed());
 
     let wallet = Pubkey::from_str(WALLET_ADDRESS)?;
 
     let now = chrono::Utc::now();
     let cutoff_ts = now.timestamp() - 24 * 3600;
 
-    let mut before_signature: Option<String> = None;
+    let mut before_signature: Option<Signature> = None;
     let mut transfers = Vec::new();
 
     'outer: loop {
         let sigs = client.get_signatures_for_address_with_config(
             &wallet,
             GetConfirmedSignaturesForAddress2Config {
-                before: before_signature.clone(),
+                before: before_signature,
                 until: None,
                 limit: Some(1000),
-                commitment: Some(solana_sdk::commitment_config::CommitmentConfig::confirmed()),
+                commitment: Some(CommitmentConfig::confirmed()),
             },
         )?;
 
@@ -40,11 +44,10 @@ async fn backfill_usdc_transfers() -> Result<String> {
         }
 
         for sig_info in &sigs {
-            let block_time_opt = sig_info.block_time;
-            if block_time_opt.is_none() {
-                continue; // skip if no block time
-            }
-            let block_time = block_time_opt.unwrap();
+            let block_time = match sig_info.block_time {
+                Some(ts) => ts,
+                None => continue,
+            };
 
             if block_time < cutoff_ts {
                 break 'outer;
@@ -111,7 +114,7 @@ async fn backfill_usdc_transfers() -> Result<String> {
                                 continue;
                             }
 
-                            let amount = amount_u64 as f64 / 1_000_000f64; // USDC has 6 decimals
+                            let amount = amount_u64 as f64 / 1_000_000f64;
 
                             let direction = if let Some(src) = source {
                                 if src == WALLET_ADDRESS {
@@ -129,15 +132,17 @@ async fn backfill_usdc_transfers() -> Result<String> {
                                 continue;
                             };
 
-                            // Use recommended date construction
-                            let date = DateTime::<Utc>::from_timestamp(block_time, 0);
+                            let date = DateTime::<Utc>::from_utc(
+                                chrono::NaiveDateTime::from_timestamp(block_time, 0),
+                                Utc,
+                            );
 
                             transfers.push(format!(
                                 "{} | {}{:.6} USDC | {}",
                                 date.to_rfc3339(),
                                 if direction == "sent" { "-" } else { "+" },
                                 amount,
-                                direction,
+                                direction
                             ));
                         }
                         _ => continue,
@@ -146,7 +151,7 @@ async fn backfill_usdc_transfers() -> Result<String> {
             }
         }
 
-        before_signature = sigs.last().map(|s| s.signature.clone());
+        before_signature = sigs.last().map(|s| s.signature.parse().ok()).flatten();
     }
 
     transfers.sort();
@@ -169,4 +174,4 @@ async fn main() {
 
     warp::serve(route).run(([0, 0, 0, 0], 10000)).await;
                                 }
-                        
+                                
