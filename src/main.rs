@@ -2,14 +2,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use solana_client::rpc_client::{RpcClient, GetConfirmedSignaturesForAddress2Config};
 use solana_client::rpc_config::RpcTransactionConfig;
-use solana_sdk::{
-    pubkey::Pubkey,
-    signature::Signature,
-    commitment_config::CommitmentConfig,
-};
-use solana_transaction_status::{
-    EncodedTransaction, UiInstruction, UiParsedInstruction, UiTransactionEncoding,
-};
+use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signature};
+use solana_transaction_status::{EncodedTransaction, UiInstruction, UiParsedInstruction, UiTransactionEncoding};
 use std::str::FromStr;
 use warp::Filter;
 
@@ -48,7 +42,6 @@ async fn backfill_usdc_transfers() -> Result<String> {
                 Some(ts) => ts,
                 None => continue,
             };
-
             if block_time < cutoff_ts {
                 break 'outer;
             }
@@ -64,6 +57,7 @@ async fn backfill_usdc_transfers() -> Result<String> {
 
             let enc_tx = &tx.transaction.transaction;
 
+            // Correct access to instructions via UiParsedMessage from EncodedTransaction::Json
             let instructions = match enc_tx {
                 EncodedTransaction::Json(parsed_tx) => &parsed_tx.message.instructions,
                 _ => continue,
@@ -71,81 +65,68 @@ async fn backfill_usdc_transfers() -> Result<String> {
 
             for ix in instructions {
                 if let UiInstruction::Parsed(ui_parsed) = ix {
-                    match ui_parsed {
-                        UiParsedInstruction::Parsed(parsed) => {
-                            if parsed.program != "spl-token" {
+                    if let UiParsedInstruction::Parsed(parsed) = ui_parsed {
+                        if parsed.program != "spl-token" {
+                            continue;
+                        }
+
+                        let instruction_type = parsed.parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if instruction_type != "transfer" && instruction_type != "transferChecked" {
+                            continue;
+                        }
+
+                        let info = match parsed.parsed.get("info") {
+                            Some(i) => i,
+                            None => continue,
+                        };
+
+                        if let Some(mint) = info.get("mint").and_then(|v| v.as_str()) {
+                            if mint != USDC_MINT_ADDRESS {
                                 continue;
                             }
+                        }
 
-                            let instruction_type = parsed
-                                .parsed
-                                .get("type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if instruction_type != "transfer" && instruction_type != "transferChecked" {
-                                continue;
-                            }
+                        let source = info.get("source").and_then(|v| v.as_str());
+                        let destination = info.get("destination").and_then(|v| v.as_str());
 
-                            let info = match parsed.parsed.get("info") {
-                                Some(i) => i,
-                                None => continue,
-                            };
+                        let amount_str = info
+                            .get("amount")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| info.get("tokenAmount").and_then(|token_amount| token_amount.get("amount").and_then(|v| v.as_str())))
+                            .unwrap_or("0");
 
-                            if let Some(mint) = info.get("mint").and_then(|v| v.as_str()) {
-                                if mint != USDC_MINT_ADDRESS {
-                                    continue;
-                                }
-                            }
+                        let amount_u64 = amount_str.parse::<u64>().unwrap_or(0);
+                        if amount_u64 == 0 {
+                            continue;
+                        }
 
-                            let source = info.get("source").and_then(|v| v.as_str());
-                            let destination = info.get("destination").and_then(|v| v.as_str());
+                        let amount = amount_u64 as f64 / 1_000_000f64;
 
-                            let amount_str = info
-                                .get("amount")
-                                .and_then(|v| v.as_str())
-                                .or_else(|| {
-                                    info.get("tokenAmount")
-                                        .and_then(|token_amount| token_amount.get("amount").and_then(|v| v.as_str()))
-                                })
-                                .unwrap_or("0");
-
-                            let amount_u64 = amount_str.parse::<u64>().unwrap_or(0);
-                            if amount_u64 == 0 {
-                                continue;
-                            }
-
-                            let amount = amount_u64 as f64 / 1_000_000f64;
-
-                            let direction = if let Some(src) = source {
-                                if src == WALLET_ADDRESS {
-                                    "sent"
-                                } else if let Some(dest) = destination {
-                                    if dest == WALLET_ADDRESS {
-                                        "received"
-                                    } else {
-                                        continue;
-                                    }
+                        let direction = if let Some(src) = source {
+                            if src == WALLET_ADDRESS {
+                                "sent"
+                            } else if let Some(dest) = destination {
+                                if dest == WALLET_ADDRESS {
+                                    "received"
                                 } else {
                                     continue;
                                 }
                             } else {
                                 continue;
-                            };
+                            }
+                        } else {
+                            continue;
+                        };
 
-                            let date = DateTime::<Utc>::from_utc(
-                                chrono::NaiveDateTime::from_timestamp(block_time, 0),
-                                Utc,
-                            );
+                        let date = DateTime::<Utc>::from_timestamp(block_time, 0);
 
-                            transfers.push(format!(
-                                "{} | {}{:.6} USDC | {}",
-                                date.to_rfc3339(),
-                                if direction == "sent" { "-" } else { "+" },
-                                amount,
-                                direction
-                            ));
-                        }
-                        _ => continue,
+                        transfers.push(format!(
+                            "{} | {}{:.6} USDC | {}",
+                            date.to_rfc3339(),
+                            if direction == "sent" { "-" } else { "+" },
+                            amount,
+                            direction,
+                        ));
                     }
                 }
             }
@@ -161,17 +142,13 @@ async fn backfill_usdc_transfers() -> Result<String> {
 async fn handle_backfill() -> Result<impl warp::Reply, warp::Rejection> {
     match backfill_usdc_transfers().await {
         Ok(data) => Ok(warp::reply::with_status(data, warp::http::StatusCode::OK)),
-        Err(e) => Ok(warp::reply::with_status(
-            format!("Error: {}", e),
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-        )),
+        Err(e) => Ok(warp::reply::with_status(format!("Error: {}", e), warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
     }
 }
 
 #[tokio::main]
 async fn main() {
     let route = warp::path("backfill").and(warp::get()).and_then(handle_backfill);
-
     warp::serve(route).run(([0, 0, 0, 0], 10000)).await;
-                                }
-                                
+                }
+            
