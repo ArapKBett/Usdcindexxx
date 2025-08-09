@@ -3,7 +3,9 @@ use chrono::{DateTime, Utc};
 use solana_client::rpc_client::{RpcClient, GetConfirmedSignaturesForAddress2Config};
 use solana_client::rpc_config::RpcTransactionConfig;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signature};
-use solana_transaction_status::{EncodedTransaction, UiInstruction, UiParsedInstruction, UiTransactionEncoding};
+use solana_transaction_status::{
+    EncodedTransaction, UiInstruction, UiParsedInstruction, UiMessage, UiTransactionEncoding,
+};
 use std::str::FromStr;
 use warp::Filter;
 
@@ -17,7 +19,7 @@ async fn backfill_usdc_transfers() -> Result<String> {
     let wallet = Pubkey::from_str(WALLET_ADDRESS)?;
 
     let now = chrono::Utc::now();
-    let cutoff_ts = now.timestamp() - 24 * 3600;
+    let cutoff_ts = now.timestamp() - 24 * 3600; // 24 hours ago
 
     let mut before_signature: Option<Signature> = None;
     let mut transfers = Vec::new();
@@ -42,6 +44,7 @@ async fn backfill_usdc_transfers() -> Result<String> {
                 Some(ts) => ts,
                 None => continue,
             };
+
             if block_time < cutoff_ts {
                 break 'outer;
             }
@@ -57,9 +60,12 @@ async fn backfill_usdc_transfers() -> Result<String> {
 
             let enc_tx = &tx.transaction.transaction;
 
-            // Correct access to instructions via UiParsedMessage from EncodedTransaction::Json
+            // Match UiMessage enum to get instructions
             let instructions = match enc_tx {
-                EncodedTransaction::Json(parsed_tx) => &parsed_tx.message.instructions,
+                EncodedTransaction::Json(parsed_tx) => match &parsed_tx.message {
+                    UiMessage::Parsed(parsed_message) => &parsed_message.instructions,
+                    _ => continue,
+                },
                 _ => continue,
             };
 
@@ -92,7 +98,9 @@ async fn backfill_usdc_transfers() -> Result<String> {
                         let amount_str = info
                             .get("amount")
                             .and_then(|v| v.as_str())
-                            .or_else(|| info.get("tokenAmount").and_then(|token_amount| token_amount.get("amount").and_then(|v| v.as_str())))
+                            .or_else(|| {
+                                info.get("tokenAmount").and_then(|token_amount| token_amount.get("amount").and_then(|v| v.as_str()))
+                            })
                             .unwrap_or("0");
 
                         let amount_u64 = amount_str.parse::<u64>().unwrap_or(0);
@@ -100,7 +108,7 @@ async fn backfill_usdc_transfers() -> Result<String> {
                             continue;
                         }
 
-                        let amount = amount_u64 as f64 / 1_000_000f64;
+                        let amount = amount_u64 as f64 / 1_000_000f64; // USDC decimals = 6
 
                         let direction = if let Some(src) = source {
                             if src == WALLET_ADDRESS {
@@ -142,13 +150,19 @@ async fn backfill_usdc_transfers() -> Result<String> {
 async fn handle_backfill() -> Result<impl warp::Reply, warp::Rejection> {
     match backfill_usdc_transfers().await {
         Ok(data) => Ok(warp::reply::with_status(data, warp::http::StatusCode::OK)),
-        Err(e) => Ok(warp::reply::with_status(format!("Error: {}", e), warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
+        Err(e) => Ok(warp::reply::with_status(
+            format!("Error: {}", e),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )),
     }
 }
 
 #[tokio::main]
 async fn main() {
+    // Warp route on /backfill
     let route = warp::path("backfill").and(warp::get()).and_then(handle_backfill);
+
+    // Bind to port 10000 on all interfaces (Render default)
     warp::serve(route).run(([0, 0, 0, 0], 10000)).await;
-                }
-            
+                            }
+                    
